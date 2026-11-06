@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Session Hijacking Lab</title>
+<style>
+  body { font-family: system-ui, Arial, sans-serif; margin: 0; padding: 24px; background: #f4f6fb; color: #1d2433; }
+  h1 { margin-top: 0; }
+  .note { background: #fff3cd; padding: 10px 14px; border-radius: 6px; }
+  .grid { display: grid; grid-template-columns: 320px 1fr; gap: 20px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: #fff; border-radius: 10px; padding: 18px; box-shadow: 0 1px 4px rgba(0,0,0,.08); margin-bottom: 20px; }
+  label { display: block; margin: 12px 0; }
+  select, button { padding: 6px 10px; font-size: 14px; }
+  button { background: #3b5bdb; color: #fff; border: none; border-radius: 6px; cursor: pointer; margin-right: 6px; }
+  button.secondary { background: #868e96; }
+  .actors { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 16px; }
+  .actor { flex: 1; text-align: center; padding: 16px 8px; border-radius: 8px; background: #e7ecff; font-weight: 600; }
+  .actor.attacker { background: #ffe3e3; }
+  .actor.active { outline: 3px solid #f08c00; }
+  .result { padding: 12px; border-radius: 8px; font-weight: 600; margin-bottom: 12px; }
+  .result.bad { background: #ffe3e3; color: #a61e4d; }
+  .result.good { background: #d3f9d8; color: #2b8a3e; }
+  #log li { margin-bottom: 8px; line-height: 1.4; }
+  #log li.attack { color: #a61e4d; }
+</style>
+</head>
+<body>
+
+<h1>Session Hijacking: Interactive Lab</h1>
+<p class="note">This is a classroom simulation. It sends no real network traffic and performs no real attacks. All tokens are random sample values.</p>
+
+<div class="grid">
+  <div>
+    <section class="panel">
+      <h2>Settings</h2>
+      <label>Attack scenario
+        <select id="scenario"></select>
+      </label>
+      <label><input type="checkbox" id="https"> Site uses HTTPS</label>
+      <label><input type="checkbox" id="secure"> Cookie has Secure flag</label>
+      <label><input type="checkbox" id="httpOnly"> Cookie has HttpOnly flag</label>
+      <label>SameSite attribute
+        <select id="sameSite">
+          <option value="none">None</option>
+          <option value="lax">Lax</option>
+          <option value="strict">Strict</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="rotate"> Rotate token after each request</label>
+      <label>Token entropy: <strong id="entropyLabel">32</strong> bits
+        <input type="range" id="entropy" min="8" max="128" step="8" value="32" style="width:100%">
+      </label>
+      <button id="run">Run simulation</button>
+      <button id="reset" class="secondary">Clear log</button>
+    </section>
+
+    <section class="panel">
+      <h2>Entropy check</h2>
+      <p id="entropyInfo"></p>
+    </section>
+  </div>
+
+  <div>
+    <section class="panel">
+      <div class="actors">
+        <div class="actor">Victim browser</div>
+        <div class="actor">Web server</div>
+        <div class="actor attacker" id="actor-attacker">Attacker</div>
+      </div>
+      <div id="result" class="result"></div>
+      <h3>Step log</h3>
+      <ol id="log"></ol>
+    </section>
+
+    <section class="panel">
+      <h2>What this scenario teaches</h2>
+      <p id="explain"></p>
+    </section>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function randomHex(bits) {
+  const bytes = new Uint8Array(Math.ceil(bits / 8));
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+const SCENARIOS = {
+  sniff: {
+    label: 'Packet sniffing of unencrypted traffic',
+    explain: 'When traffic is not encrypted, anyone on the same network path can read the session cookie from the packets. HTTPS (TLS) encrypts the channel, so the attacker sees only ciphertext. HTTPS does not stop the other attacks in this lab.',
+    run(c) {
+      const hit = !c.https;
+      return {
+        success: hit,
+        steps: [
+          { from: 'client', to: 'server', text: c.https ? 'Victim logs in over HTTPS. Credentials and cookies are encrypted by TLS.' : 'Victim logs in over plain HTTP. Credentials travel as readable text.' },
+          { from: 'server', to: 'client', text: `Server replies with Set-Cookie: session=${c.token}` },
+          { from: 'client', to: 'server', text: 'Victim browser sends the next request with the Cookie header.' },
+          { from: 'attacker', to: 'client', attack: hit, text: hit ? `Attacker on the same network reads "session=${c.token}" from the captured packet.` : 'Attacker captures the packet but sees only encrypted bytes.' }
+        ],
+        summary: hit ? 'The session cookie was readable in transit.' : 'TLS encrypted the cookie, so sniffing did not reveal it.'
+      };
+    }
+  },
+
+  predictable: {
+    label: 'Predictable session tokens',
+    explain: 'If session tokens are generated with too little randomness, an attacker can guess a valid token without ever seeing the victim’s traffic. Every extra bit of entropy doubles the search space. Use a cryptographically secure random generator and at least 128 bits of entropy.',
+    run(c) {
+      const guesses = Math.pow(2, c.bits - 1);
+      const hit = c.bits <= 41;
+      return {
+        success: hit,
+        steps: [
+          { from: 'server', to: 'client', text: `Server issues token ${c.token} with ${c.bits} bits of randomness.` },
+          { from: 'attacker', to: 'server', attack: true, text: `Attacker tries candidate tokens. Expected attempts: about ${guesses.toExponential(2)}.` },
+          { from: 'attacker', to: 'server', attack: hit, text: hit ? 'Within the lab assumption of about 2^40 attempts, the attacker finds a valid token and reuses it.' : 'The search space is too large for the lab attacker budget, so the search fails.' }
+        ],
+        summary: hit ? 'The token space was small enough to brute-force.' : 'The token space was too large to brute-force in practice.'
+      };
+    }
+  },
+
+  dns: {
+    label: 'DNS cache poisoning',
+    explain: 'DNS poisoning sends the victim to the attacker’s server instead of the real site. Without HTTPS, the browser sends the cookie to whoever answers. With HTTPS, the certificate must match the domain name, so the browser refuses the attacker’s server.',
+    run(c) {
+      const hit = !c.https;
+      const steps = [
+        { from: 'attacker', to: 'server', attack: true, text: 'Attacker poisons a DNS resolver cache so the bank’s domain points to the attacker’s server.' },
+        { from: 'client', to: 'attacker', text: 'Victim browser connects to the domain and reaches the attacker’s server.' }
+      ];
+      if (c.https) {
+        steps.push({ from: 'client', to: 'client', text: 'Browser checks the certificate. It does not match the domain, so it shows an error and refuses the connection.' });
+      } else {
+        steps.push({ from: 'client', to: 'attacker', attack: true, text: `Victim sends the cookie to the attacker’s server: session=${c.token}` });
+      }
+      return {
+        success: hit,
+        steps,
+        summary: hit ? 'The victim sent the session cookie to the attacker.' : 'Certificate validation stopped the redirected connection.'
+      };
+    }
+  },
+
+  mixed: {
+    label: 'Mixed HTTPS/HTTP content',
+    explain: 'A page can load HTTPS for the main content while still requesting a resource over HTTP, such as an image or script. The browser then sends cookies with the plain-text request unless the cookie has the Secure flag, which blocks sending it over HTTP.',
+    run(c) {
+      const hit = !c.secure;
+      return {
+        success: hit,
+        steps: [
+          { from: 'client', to: 'server', text: 'Victim loads the secure HTTPS page.' },
+          { from: 'server', to: 'client', text: 'The page includes an image loaded over http://, which is unencrypted.' },
+          { from: 'client', to: 'server', text: hit ? `Browser requests the HTTP resource with the cookie attached: session=${c.token}` : 'Browser does not attach the cookie to the HTTP request because of the Secure flag.' },
+          { from: 'attacker', to: 'client', attack: hit, text: hit ? 'Attacker on the network path reads the cookie from the plain-text request.' : 'Attacker finds no cookie in the plain-text request.' }
+        ],
+        summary: hit ? 'The cookie leaked through the HTTP resource.' : 'The Secure flag kept the cookie off the HTTP request.'
+      };
+    }
+  },
+
+  xss: {
+    label: 'Cross-site scripting (XSS)',
+    explain: 'XSS lets an attacker run JavaScript in the victim’s browser on the real site. That script can read document.cookie. The HttpOnly flag hides the cookie from JavaScript, so the script cannot read it. XSS can still do other damage, such as acting on the victim’s behalf.',
+    run(c) {
+      const hit = !c.httpOnly;
+      return {
+        success: hit,
+        steps: [
+          { from: 'attacker', to: 'server', attack: true, text: 'Attacker stores a malicious script in a comment on the site (stored XSS).' },
+          { from: 'server', to: 'client', text: 'Victim loads the page, and the malicious script runs in the victim’s browser.' },
+          { from: 'client', to: 'attacker', attack: hit, text: hit ? `Script reads document.cookie and sends the session value to the attacker: session=${c.token}` : 'Script runs document.cookie, but the HttpOnly cookie is not included in the result.' }
+        ],
+        summary: hit ? 'JavaScript could read the session cookie.' : 'HttpOnly prevented JavaScript from reading the session cookie.'
+      };
+    }
+  },
+
+  sidechannel: {
+    label: 'Side channels and memory leakage',
+    explain: 'Side-channel attacks infer secrets from indirect signals such as timing, cache behavior, or leaked memory. Constant-time code and careful memory handling reduce the risk. Rotating tokens limits how long a leaked token stays useful, but it does not remove the leak.',
+    run(c) {
+      const hit = !c.rotate;
+      return {
+        success: hit,
+        steps: [
+          { from: 'server', to: 'server', text: `Server keeps the active token ${c.token} in memory while handling the victim’s request.` },
+          { from: 'attacker', to: 'server', attack: true, text: 'Attacker on the same machine observes cache timing or leaked memory and recovers the token.' },
+          { from: 'attacker', to: 'server', attack: hit, text: hit ? 'The recovered token is still valid, so the attacker reuses it.' : 'The token was rotated after the request, so the recovered copy is no longer valid.' }
+        ],
+        summary: hit ? 'The leaked token stayed valid long enough to reuse.' : 'Token rotation made the leaked value expire.'
+      };
+    }
+  },
+
+  csrf: {
+    label: 'Cross-site request forgery (CSRF)',
+    explain: 'CSRF does not steal the cookie. Instead, a malicious page makes the victim’s browser send a request to the real site, and the browser attaches the cookie automatically. The SameSite attribute tells the browser to withhold the cookie on cross-site requests. The Secure and HttpOnly flags do not prevent CSRF.',
+    run(c) {
+      const hit = c.sameSite === 'none';
+      return {
+        success: hit,
+        steps: [
+          { from: 'client', to: 'server', text: 'Victim is logged into the bank, so the browser holds the session cookie.' },
+          { from: 'client', to: 'attacker', text: 'Victim visits a malicious page in another tab.' },
+          { from: 'attacker', to: 'server', attack: true, text: 'The malicious page automatically submits a form to the bank’s transfer endpoint.' },
+          { from: 'client', to: 'server', attack: hit, text: hit ? 'Browser attaches the cookie to the cross-site request, so the transfer executes.' : `Browser withholds the cookie on the cross-site request (SameSite=${c.sameSite}), so the server rejects it.` }
+        ],
+        summary: hit ? 'The forged request was authenticated with the victim’s cookie.' : 'SameSite stopped the cookie from being sent with the cross-site request.'
+      };
+    }
+  }
+};
+
+function cfg() {
+  const bits = +$('entropy').value;
+  return {
+    https: $('https').checked,
+    secure: $('secure').checked,
+    httpOnly: $('httpOnly').checked,
+    sameSite: $('sameSite').value,
+    rotate: $('rotate').checked,
+    bits,
+    token: randomHex(bits)
+  };
+}
+
+function updateEntropy() {
+  const bits = +$('entropy').value;
+  $('entropyLabel').textContent = bits;
+  const g = Math.pow(2, bits - 1);
+  const feasible = bits <= 41;
+  $('entropyInfo').textContent = `With ${bits} bits, an attacker needs about ${g.toExponential(2)} guesses on average. ` +
+    (feasible
+      ? 'Under the lab assumption of about 2^40 attempts, this is feasible.'
+      : 'That is far beyond the lab assumption of about 2^40 attempts, so brute force is impractical.');
+}
+
+function clearLog() {
+  $('log').innerHTML = '';
+  $('result').textContent = '';
+  $('result').className = 'result';
+  $('actor-attacker').classList.remove('active');
+}
+
+function run() {
+  const c = cfg();
+  const scenario = SCENARIOS[$('scenario').value];
+  const r = scenario.run(c);
+
+  $('log').innerHTML = '';
+  r.steps.forEach(st => {
+    const li = document.createElement('li');
+    li.textContent = st.text;
+    if (st.attack) li.className = 'attack';
+    $('log').appendChild(li);
+  });
+
+  const res = $('result');
+  res.className = 'result ' + (r.success ? 'bad' : 'good');
+  res.textContent = (r.success ? 'Attack succeeds with these settings. ' : 'Attack blocked with these settings. ') + r.summary;
+  $('actor-attacker').classList.toggle('active', r.success);
+}
+
+function init() {
+  const sel = $('scenario');
+  Object.entries(SCENARIOS).forEach(([key, s]) => {
+    const opt = document.createElement('option');
+    opt.value = key;
+    opt.textContent = s.label;
+    sel.appendChild(opt);
+  });
+
+  sel.addEventListener('change', () => {
+    $('explain').textContent = SCENARIOS[sel.value].explain;
+    run();
+  });
+  ['https', 'secure', 'httpOnly', 'sameSite', 'rotate'].forEach(id =>
+    $(id).addEventListener('change', run));
+  $('entropy').addEventListener('input', () => { updateEntropy(); run(); });
+  $('run').addEventListener('click', run);
+  $('reset').addEventListener('click', clearLog);
+
+  $('explain').textContent = SCENARIOS[sel.value].explain;
+  updateEntropy();
+  run();
+}
+
+init();
+</script>
+</body>
+</html>
